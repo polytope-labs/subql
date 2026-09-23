@@ -165,10 +165,10 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
     return this.nodeConfig.unfinalizedBlocks ? this.latestBestHeight : this.latestFinalizedHeight;
   }
 
-  // eslint-disable-next-line complexity
   async fillNextBlockBuffer(initBlockHeight: number): Promise<void> {
     let startBlockHeight: number;
     let scaledBatchSize: number;
+    let rewindWaitTicks = 0;
 
     const getStartBlockHeight = (): number => {
       return this.blockDispatcher.latestBufferedHeight
@@ -183,6 +183,8 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
 
       const latestHeight = this.latestHeight();
 
+      const multiChainStatus = this.multiChainRewindService.status;
+
       if (this.blockDispatcher.freeSize < scaledBatchSize || startBlockHeight > latestHeight) {
         if (this.blockDispatcher.freeSize < scaledBatchSize) {
           logger.debug(
@@ -193,6 +195,11 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
           logger.debug(
             `Fetch service is waiting for new blocks, startBlockHeight: ${startBlockHeight}, latestHeight: ${latestHeight}`
           );
+          // A rewind is normally run after the next processed block; with no new blocks that never comes
+          const waitRewindHeader = this.multiChainRewindService.waitRewindHeader;
+          if (multiChainStatus === MultiChainRewindStatus.Incomplete && waitRewindHeader) {
+            await this.blockDispatcher.rewindIfIdle(waitRewindHeader);
+          }
         }
         await delay(1);
         continue;
@@ -202,14 +209,16 @@ export class FetchService<DS extends BaseDataSource, B extends IBlockDispatcher<
       void this.storeModelProvider.metadata.set('targetHeight', latestHeight);
 
       // If we're rewinding, we should wait until it's done
-      const multiChainStatus = this.multiChainRewindService.status;
       if (!this.nodeConfig.disableMultichainRewindLock && MultiChainRewindStatus.Complete === multiChainStatus) {
-        logger.info(
-          `Waiting for all chains to complete rewind, current chainId: ${this.multiChainRewindService.chainId}`
-        );
+        if (rewindWaitTicks++ % 10 === 0) {
+          logger.info(
+            `Waiting for all chains to complete rewind, current chainId: ${this.multiChainRewindService.chainId}, waiting for: ${this.multiChainRewindService.waitingFor.join(', ')}`
+          );
+        }
         await delay(multiChainRewindDelay);
         continue;
       }
+      rewindWaitTicks = 0;
 
       // This could be latestBestHeight, dictionary should never include finalized blocks
       // TODO add buffer so dictionary not used when project synced
